@@ -17,8 +17,9 @@
 #
 # Authors:
 #   Guillaume Destuynder <gdestuynder@mozilla.com>
+#   Aleksey Chudov <aleksey.chudov@gmail.com>
 
-VERSION	:= 2.1.0
+VERSION	:= 1.0.0
 
 #FPM options, suggestions:
 # --replaces audisp-cef
@@ -50,7 +51,7 @@ else
 endif
 
 LDFLAGS	:= -pie -Wl,-z,relro
-LIBS	:= -lauparse -laudit `curl-config --libs`
+LIBS	:= -lauparse -laudit
 DEFINES	:= -DPROGRAM_VERSION\=${VERSION} ${REORDER_HACKF} ${IGNORE_EMPTY_EXECVE_COMMANDF}
 
 GCC		:= gcc
@@ -60,45 +61,38 @@ INSTALL	:= install
 DESTDIR	:= /
 PREFIX	:= /usr
 
-all: audisp-json
+all: audisp-graylog
 
-audisp-json: json-config.o audisp-json.o
-	${LIBTOOL} --tag=CC --mode=link gcc ${CFLAGS} ${LDFLAGS} ${LIBS} -o audisp-json json-config.o audisp-json.o
+audisp-graylog: audisp-graylog.o
+	${LIBTOOL} --tag=CC --mode=link gcc ${CFLAGS} ${LDFLAGS} ${LIBS} -o audisp-graylog audisp-graylog.o
 
-json-config.o: json-config.c
-	${GCC} -I. ${CFLAGS} ${LIBS} -c -o json-config.o json-config.c
+audisp-graylog.o: audisp-graylog.c
+	${GCC} -I. ${CFLAGS} ${DEBUGF} ${LIBS} ${DEFINES} -c -o audisp-graylog.o audisp-graylog.c
 
-audisp-json.o: audisp-json.c
-	${GCC} -I. ${CFLAGS} ${DEBUGF} ${LIBS} ${DEFINES} -c -o audisp-json.o audisp-json.c
-
-install: audisp-json au-json.conf audisp-json.conf
-	${INSTALL} -D -m 0644 au-json.conf ${DESTDIR}/${PREFIX}/etc/audisp/plugins.d/au-json.conf
-	${INSTALL} -D -m 0644 audisp-json.conf ${DESTDIR}/${PREFIX}/etc/audisp/audisp-json.conf
-	${INSTALL} -D -m 0755 audisp-json ${DESTDIR}/${PREFIX}/sbin/audisp-json
+install: audisp-graylog graylog.conf
+	${INSTALL} -D -m 0755 audisp-graylog ${DESTDIR}/${PREFIX}/sbin/audisp-graylog
+	${INSTALL} -D -m 0644 graylog.conf ${DESTDIR}/${PREFIX}/etc/audisp/plugins.d/graylog.conf
 
 uninstall:
-	rm -f ${DESTDIR}/${PREFIX}/etc/audisp/plugins.d/au-json.conf
-	rm -f ${DESTDIR}/${PREFIX}/etc/audisp/audisp-json.conf
-	rm -f ${DESTDIR}/${PREFIX}/sbin/audisp-json
+	rm -f ${DESTDIR}/${PREFIX}/sbin/audisp-graylog
+	rm -f ${DESTDIR}/${PREFIX}/etc/audisp/plugins.d/graylog.conf
 
-packaging: audisp-json au-json.conf audisp-json.conf
-	${INSTALL} -D -m 0644 au-json.conf tmp/etc/audisp/plugins.d/au-json.conf
-	${INSTALL} -D -m 0644 audisp-json.conf tmp/etc/audisp/audisp-json.conf
-	${INSTALL} -D -m 0755 audisp-json tmp/sbin/audisp-json
+packaging: audisp-graylog graylog.conf
+	${INSTALL} -D -m 0755 audisp-graylog tmp/sbin/audisp-graylog
+	${INSTALL} -D -m 0644 graylog.conf tmp/etc/audisp/plugins.d/graylog.conf
 
 rpm: packaging
-	fpm ${FPMOPTS} -C tmp -v ${VERSION} -n audisp-json --license GPL --vendor mozilla --description "json plugin for Linux Audit" \
-		--url https://github.com/gdestuynder/audisp-json -d audit-libs -d libcurl \
-		--config-files etc/audisp/plugins.d/au-json.conf --config-files etc/audisp/audisp-json.conf -s dir -t rpm .
+	fpm ${FPMOPTS} -C tmp -v ${VERSION} -n audisp-graylog --license GPL --description "Graylog plugin for Auditd" \
+		--url https://github.com/AlekseyChudov/audisp-graylog -d audit-libs \
+		--config-files etc/audisp/plugins.d/graylog.conf -s dir -t rpm .
 
 deb: packaging
-	fpm ${FPMOPTS} -C tmp -v ${VERSION} -n audisp-json --license GPL --vendor mozilla --description "json plugin for Linux Audit" \
-		--url https://github.com/gdestuynder/audisp-json -d auditd -d libcurl3 \
-		--deb-build-depends libaudit-dev --deb-build-depends libcurl4-openssl-dev \
-		--config-files etc/audisp/plugins.d/au-json.conf --config-files etc/audisp/audisp-json.conf -s dir -t deb .
+	fpm ${FPMOPTS} -C tmp -v ${VERSION} -n audisp-graylog --license GPL --description "Graylog plugin for Auditd" \
+		--url https://github.com/AlekseyChudov/audisp-graylog -d auditd --deb-build-depends libaudit-dev \
+		--config-files etc/audisp/plugins.d/graylog.conf -s dir -t deb .
 
 clean:
-	rm -f audisp-json
+	rm -f audisp-graylog
 	rm -fr *.o
 	rm -fr tmp
 	rm -rf *.rpm

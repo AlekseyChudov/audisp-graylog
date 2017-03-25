@@ -1,5 +1,5 @@
 /* vim: ts=4:sw=4:noexpandtab
- * audisp-json.c --
+ * audisp-graylog.c --
  * Copyright (c) 2014 Mozilla Corporation.
  * Portions Copyright 2008 Red Hat Inc., Durham, North Carolina.
  * All Rights Reserved.
@@ -21,6 +21,7 @@
  * Authors:
  *   Guillaume Destuynder <gdestuynder@mozilla.com>
  *   Steve Grubb <sgrubb@redhat.com>
+ *   Aleksey Chudov <aleksey.chudov@gmail.com>
  *
  */
 
@@ -31,25 +32,11 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <pwd.h>
 #include <netdb.h>
-#include <sys/stat.h>
-#include <time.h>
-#include <curl/curl.h>
 #include "libaudit.h"
 #include "auparse.h"
-#include "json-config.h"
 
-#define CONFIG_FILE "/etc/audisp/audisp-json.conf"
-#define CONFIG_FILE_LOCAL "audisp-json.conf"
-/* after this amount of time for any response (connect, http reply, etc.) just give up
- * and lose messages.
- * don't set this too high as new curl handles will be created and consume memory while 
- * waiting for the connection to work again.
- */
-#define MAX_CURL_GLOBAL_TIMEOUT 5000L
-#define MAX_CURL_QUEUE_SIZE 8192
 #define MAX_JSON_MSG_SIZE 4096
 #define MAX_ARG_LEN 2048
 #define MAX_SUMMARY_LEN 256
@@ -59,35 +46,21 @@
 #define NR_LINES_BUFFERED 64
 #endif
 
-#define HTTP_CODE_OK 200
-
 #ifndef PROGRAM_VERSION
 #define PROGRAM_VERSION "1"
 #endif
 #ifndef PROGRAM_NAME
-#define PROGRAM_NAME "audisp-json"
+#define PROGRAM_NAME "audisp-graylog"
 #endif
-/* transform macro int and str value to ... str - needed for defining USER_AGENT ;)*/
 #define _STR(x) #x
 #define STR(x) _STR(x)
-#define USER_AGENT PROGRAM_NAME"/"STR(PROGRAM_VERSION)
 
 extern int h_errno;
 
 static volatile int sig_stop = 0;
-static volatile int sig_hup = 0;
-static json_conf_t config;
 static char *hostname = NULL;
 static auparse_state_t *au = NULL;
 static int machine = -1;
-
-static long int curl_timeout = -1;
-FILE *curl_logfile;
-CURLM *multi_h;
-CURL *easy_h;
-struct curl_slist *slist1;
-int curl_nr_h = -1;
-int msg_lost = 0;
 
 typedef struct { char *val; } msg_t;
 
@@ -100,10 +73,7 @@ typedef struct	ll {
 struct json_msg_type {
 	char	*category;
 	char	*summary;
-	char	*severity;
 	char	*hostname;
-	int		processid;
-	char	*processname;
 	char	*timestamp;
 	struct	ll *details;
 };
@@ -117,139 +87,6 @@ typedef struct lq {
 struct lq *msg_queue_list;
 unsigned int msg_queue_list_size = 0;
 
-void prepare_curl_handle(char *new_msg)
-{
-	curl_easy_reset(easy_h);
-	curl_easy_setopt(easy_h, CURLOPT_URL, config.mozdef_url);
-	curl_easy_setopt(easy_h, CURLOPT_NOPROGRESS, 1L);
-	curl_easy_setopt(easy_h, CURLOPT_USERAGENT, USER_AGENT);
-	curl_easy_setopt(easy_h, CURLOPT_HTTPHEADER, slist1);
-	curl_easy_setopt(easy_h, CURLOPT_MAXREDIRS, 10L);
-	curl_easy_setopt(easy_h, CURLOPT_CUSTOMREQUEST, "POST");
-/* keep alive is on by default and only settable in recent libcurl
- * keeping this around in case its not actually default in some cases and needs
- * to be conditionally enabled
- */
-//	curl_easy_setopt(easy_h, CURLOPT_TCP_KEEPALIVE, 1L);
-/* if logfile is set, log there instead of stderr.
- * this is generally useful in combination with the below curl_verbose option,
- * since grabbing stderr from a running plugin may be difficult.
- */
-	if (config.curl_logfile != NULL) {
-		curl_logfile = fopen(config.curl_logfile, "ab");
-		curl_easy_setopt(easy_h, CURLOPT_STDERR, curl_logfile);
-	}
-	curl_easy_setopt(easy_h, CURLOPT_VERBOSE, config.curl_verbose);
-	curl_easy_setopt(easy_h, CURLOPT_TIMEOUT_MS, MAX_CURL_GLOBAL_TIMEOUT);
-	curl_easy_setopt(easy_h, CURLOPT_SSL_VERIFYHOST, config.ssl_verify);
-	curl_easy_setopt(easy_h, CURLOPT_SSL_VERIFYPEER, config.ssl_verify);
-	curl_easy_setopt(easy_h, CURLOPT_CAINFO, config.curl_cainfo);
-	curl_easy_setopt(easy_h, CURLOPT_COPYPOSTFIELDS, new_msg);
-}
-
-/* Insert/remove new messages in the queue
- */
-int list_check_queue()
-{
-	queue_t *prev;
-
-	if (!msg_queue_list) {
-		return 1;
-	}
-
-	prev = msg_queue_list;
-	msg_queue_list = msg_queue_list->next;
-
-	curl_multi_remove_handle(multi_h, easy_h);
-	if (prev) {
-		prepare_curl_handle(prev->msg);
-		free(prev);
-		msg_queue_list_size--;
-		curl_multi_add_handle(multi_h, easy_h);
-	}
-	return 0;
-}
-
-/* select and fetch urls */
-void curl_perform(void)
-{
-	int msgs_left;
-	int maxfd = -1;
-	long http_code = 0;
-	struct timeval timeout;
-	int rc;
-	CURLMsg *msg;
-	CURLcode ret;
-	fd_set r, w, e;
-
-	/* Cleanup completed handles */
-	while ((msg = curl_multi_info_read(multi_h, &msgs_left))) {
-		if (msg->msg == CURLMSG_DONE) {
-			ret = curl_easy_getinfo(msg->easy_handle, CURLINFO_RESPONSE_CODE, &http_code);
-			if (ret != CURLM_OK) {
-			   syslog(LOG_ERR, "Couldn't send JSON message (message is lost): %s.", curl_easy_strerror(ret));
-			}
-			if (http_code > HTTP_CODE_OK) {
-				syslog(LOG_ERR, "Couldn't send JSON message (message is lost):  HTTP error code %ld.", http_code);
-			}
-		}
-	}
-
-	/* cURL will set this to 0 when there is no transfer left to process,
-	 * signaling we can sent the next message. list_check_queue() will insert the next message from the queue
-	 * into the multi_h.
-	 * If there's no message in the queue, we bail for now.
-	 */
-	if (curl_nr_h == 0) {
-		curl_nr_h = -1;
-		if (list_check_queue()) {
-			return;
-		}
-	}
-
-	FD_ZERO(&r);
-	FD_ZERO(&w);
-	FD_ZERO(&e);
-
-	/* With cURL you get the timeout you have to wait back from the library, so we use that for the select() call */
-	ret = curl_multi_timeout(multi_h, &curl_timeout);
-	if (ret != CURLM_OK) {
-		syslog(LOG_ERR, "%s", curl_multi_strerror(ret));
-	}
-	timeout.tv_sec = 0;
-	timeout.tv_usec = 100000;
-	if (curl_timeout >= 0) {
-		timeout.tv_sec = curl_timeout / 1000;
-		if (timeout.tv_sec > 1)
-			timeout.tv_sec = 1;
-		else
-			timeout.tv_usec = (curl_timeout % 1000) * 1000;
-	}
-	ret = curl_multi_fdset(multi_h, &r, &w, &e, &maxfd);
-	if (ret != CURLM_OK) {
-		syslog(LOG_ERR, "%s", curl_multi_strerror(ret));
-		return;
-	}
-
-	rc = select(maxfd+1, &r, &w, &e, &timeout);
-
-	switch(rc) {
-		case -1:
-			syslog(LOG_ERR, "%s", strerror(errno));
-			break;
-		case 0:
-		default:
-			/* This also sets curl_nr_h to exactly 0 if all the handles have been processed. */
-			while ((ret = curl_multi_perform(multi_h, &curl_nr_h)) && (ret == CURLM_CALL_MULTI_PERFORM)) {
-				continue;
-			}
-			if (ret != CURLM_OK) {
-				syslog(LOG_ERR, "%s", curl_multi_strerror(ret));
-			}
-			break;
-	}
-}
-
 static void handle_event(auparse_state_t *au,
 		auparse_cb_event_t cb_event_type, void *user_data);
 
@@ -259,23 +96,12 @@ static void int_handler(int sig)
 		fprintf(stderr, "Repeated keyboard interrupt signal, forcing unclean program termination.\n");
 		exit(127);
 	}
-
 	sig_stop = 1;
 }
 
 static void term_handler(int sig)
 {
 	sig_stop = 1;
-}
-
-static void hup_handler(int sig)
-{
-	sig_hup = 1;
-}
-
-static void reload_config(void)
-{
-	sig_hup = 0;
 }
 
 #ifdef REORDER_HACK
@@ -409,15 +235,8 @@ int main(int argc, char *argv[])
 	sa.sa_handler = int_handler;
 	if (sigaction(SIGINT, &sa, NULL) == -1)
 		return 1;
-	sa.sa_handler = hup_handler;
-	if (sigaction(SIGHUP, &sa, NULL) == -1)
-		return 1;
 
-	if (load_config(&config, CONFIG_FILE))
-		if (load_config(&config, CONFIG_FILE_LOCAL))
-			return 1;
-
-	openlog(PROGRAM_NAME, LOG_CONS, LOG_DAEMON);
+	openlog(PROGRAM_NAME, LOG_CONS, LOG_AUTHPRIV);
 
 	if (gethostname(nodename, sizeof(nodename)-1)) {
 		snprintf(nodename, 10, "localhost");
@@ -445,21 +264,6 @@ int main(int argc, char *argv[])
 
 	machine = audit_detect_machine();
 	if (machine < 0) {
-		return -1;
-	}
-
-	/* libcurl stuff */
-	if (curl_global_init(CURL_GLOBAL_ALL) != 0) {
-		syslog(LOG_ERR, "curl_global_init() failed");
-		return -1;
-	}
-
-	easy_h = curl_easy_init();
-	multi_h = curl_multi_init();
-	slist1 = NULL;
-	slist1 = curl_slist_append(slist1, "Content-Type:application/json");
-	if (!(easy_h && multi_h && slist1)) {
-		syslog(LOG_ERR, "cURL handles creation failed, this is fatal");
 		return -1;
 	}
 
@@ -491,8 +295,6 @@ int main(int argc, char *argv[])
 		 * - must always have event ids in sequential order. (REORDER_HACK takes care of that, it also buffer lines, since, well, it needs to).
 		 */
 		while (fgets_unlocked(tmp, MAX_AUDIT_MESSAGE_LENGTH, stdin)) {
-			if (sig_hup)
-				reload_config();
 			if (sig_stop)
 				break;
 
@@ -518,7 +320,6 @@ int main(int argc, char *argv[])
 #else
 			auparse_feed(au, tmp, len);
 #endif
-			curl_perform();
 		}
 
 		if (feof(stdin))
@@ -526,18 +327,7 @@ int main(int argc, char *argv[])
 	} while (sig_stop == 0);
 
 	auparse_flush_feed(au);
-
-	while (msg_queue_list)
-		curl_perform();
-
 	auparse_destroy(au);
-	curl_easy_cleanup(easy_h);
-	curl_multi_cleanup(multi_h);
-	curl_slist_free_all(slist1);
-	curl_global_cleanup();
-	if (curl_logfile)
-		fclose(curl_logfile);
-	free_config(&config);
 	free(hostname);
 #ifdef REORDER_HACK
 	free(sorted_tmp);
@@ -609,7 +399,7 @@ attr_t *_json_add_attr(attr_t *list, const char *st, char *val, int freeme)
 		syslog(LOG_ERR, "json_add_attr() malloc failed attribute will be empty: %s", st);
 		return list;
 	}
-	snprintf(new->value, MAX_ATTR_SIZE, "\t\t\"%s\": \"%s\"", st, unescape(val));
+	snprintf(new->value, MAX_ATTR_SIZE, "\"%s\":\"%s\"", st, unescape(val));
 	new->next = list;
 
 	if (freeme) {
@@ -698,59 +488,28 @@ void syslog_json_msg(struct json_msg_type json_msg)
 {
 	attr_t *head = json_msg.details;
 	attr_t *prev;
-	queue_t *new_q;
+	char msg[MAX_JSON_MSG_SIZE];
 	int len;
 
-	if (msg_queue_list_size > MAX_CURL_QUEUE_SIZE) {
-		syslog(LOG_WARNING, "syslog_json_msg() MAX_CURL_QUEUE_SIZE of %u reached, message lost!", MAX_CURL_QUEUE_SIZE);
-		return;
-	}
-
-	new_q = malloc(sizeof(queue_t));
-	if (!new_q) {
-		syslog(LOG_ERR, "syslog_json_msg() new_q malloc() failed, message lost!");
-		return;
-	}
-
-	len = snprintf(new_q->msg, MAX_JSON_MSG_SIZE,
-"{\n\
-	\"category\": \"%s\",\n\
-	\"summary\": \"%s\",\n\
-	\"severity\": \"%s\",\n\
-	\"hostname\": \"%s\",\n\
-	\"processid\": \"%i\",\n\
-	\"processname\": \"%s\",\n\
-	\"timestamp\": \"%s\",\n\
-	\"tags\": [\n\
-		\"%s\",\n\
-		\"%s\",\n\
-		\"audit\"\n\
-	],\n\
-	\"details\": {",
-		json_msg.category, json_msg.summary, json_msg.severity, json_msg.hostname, json_msg.processid,
-		PROGRAM_NAME, json_msg.timestamp, PROGRAM_NAME, STR(PROGRAM_VERSION));
+	len = snprintf(msg, MAX_JSON_MSG_SIZE,
+"{\"audit_category\":\"%s\",\"audit_summary\":\"%s\",\"audit_hostname\":\"%s\",\
+\"audit_timestamp\":\"%s\",\"audit_plugin\":\"%s\",\"audit_version\":\"%s\",\
+\"audit\":{",
+		json_msg.category, json_msg.summary, json_msg.hostname,
+		json_msg.timestamp, PROGRAM_NAME, STR(PROGRAM_VERSION));
 
 	while (head) {
-			len += snprintf(new_q->msg+len, MAX_JSON_MSG_SIZE-len, "\n%s,", head->value);
-			prev = head;
-			head = head->next;
-			free(prev);
-
-			if (head == NULL) {
-				new_q->msg[len-1] = '\n';
-			}
+		len += snprintf(msg+len, MAX_JSON_MSG_SIZE-len, "%s,", head->value);
+		prev = head;
+		head = head->next;
+		free(prev);
+		if (head == NULL)
+		    len--;
 	}
+	len += snprintf(msg+len, MAX_JSON_MSG_SIZE-len, "}}");
+	msg[MAX_JSON_MSG_SIZE-1] = '\0';
 
-	len += snprintf(new_q->msg+len, MAX_JSON_MSG_SIZE-len, "	}\n}");
-	new_q->msg[MAX_JSON_MSG_SIZE-1] = '\0';
-
-	new_q->next = msg_queue_list;
-	msg_queue_list = new_q;
-	msg_queue_list_size++;
-
-#ifdef DEBUG
-	printf("%s\n", new_q->msg);
-#endif
+	syslog(LOG_INFO, "%s", msg);
 }
 
 /* The main event handling, parsing function */
@@ -761,14 +520,11 @@ static void handle_event(auparse_state_t *au,
 
 
 	struct json_msg_type json_msg = {
-		.category		= NULL,
-		.hostname		= hostname,
-		.processid		= 0,
-		.processname	= NULL,
-		.severity		= "INFO",
-		.summary		= NULL,
-		.timestamp		= NULL,
-		.details		= NULL,
+		.category	= NULL,
+		.summary	= NULL,
+		.hostname	= hostname,
+		.timestamp	= NULL,
+		.details	= NULL,
 	};
 
 	typedef enum {
@@ -824,13 +580,15 @@ static void handle_event(auparse_state_t *au,
 		tmp = localtime(&t);
 		strftime(json_msg.timestamp, TS_LEN, "%FT%T%z", tmp);
 		snprintf(serial, TS_LEN-1, "%lu", auparse_get_serial(au));
-		json_msg.details = json_add_attr(json_msg.details, "auditserial", serial);
+		json_msg.details = json_add_attr(json_msg.details, "serial", serial);
 
 		switch (type) {
 			case AUDIT_ANOM_PROMISCUOUS:
 				dev = auparse_find_field(au, "dev");
-				if (!dev)
+				if (!dev) {
+					json_del_attrs(json_msg.details);
 					return;
+				}
 
 				havejson = 1;
 				category = CAT_PROMISC;
@@ -863,8 +621,10 @@ static void handle_event(auparse_state_t *au,
 
 			case AUDIT_AVC:
 				argc = auparse_find_field(au, "apparmor");
-				if (!argc)
+				if (!argc) {
+					json_del_attrs(json_msg.details);
 					return;
+				}
 
 				havejson = 1;
 				category = CAT_APPARMOR;
@@ -1082,14 +842,7 @@ static void handle_event(auparse_state_t *au,
 		 * .. we don't really have a choice.
 		 */
 		if (strlen(fullcmd) == 0) {
-			attr_t *head = json_msg.details;
-			attr_t *prev;
-
-			while (head) {
-				prev = head;
-				head = head->next;
-				free(prev);
-			}
+			json_del_attrs(json_msg.details);
 			return;
 		}
 #endif
@@ -1142,5 +895,4 @@ static void handle_event(auparse_state_t *au,
 
 	/* syslog_json_msg() also frees json_msg.details when called. */
 	syslog_json_msg(json_msg);
-	curl_perform();
 }

@@ -2,7 +2,7 @@
 Messages format
 ===============
 
-This document details the message format for audisp-json, and lists the possible
+This document details the message format for audisp-graylog, and lists the possible
 messages.
 
 How, Why, What
@@ -21,13 +21,13 @@ audisp plugins
 ~~~~~~~~~~~~~~
 The messages that auditd receives are then passed to audispd which is a
 multiplexer, sending back those messages to various plugins.
-Audisp-json is one of the plugins.
+Audisp-graylog is one of the plugins.
 
-As audisp-json receives several syscall messages for a single event (like "write
+As audisp-graylog receives several syscall messages for a single event (like "write
 to a file" or "execute a program"), it correlates on the message info, id and
 aggregates all relevant information for a single event into a single message.
 
-That message is then transformed to MozDef JSON format with a type, such as "EXECVE" or
+That message is then transformed to JSON format with a type, such as "EXECVE" or
 "WRITE" and send to syslog.
 
 Format example
@@ -35,47 +35,43 @@ Format example
 
 .. note::
 
-        Values such as "mode": "(null)" are omitted by audisp-json to reduce the message size.
+        Values such as "mode": "(null)" are omitted by audisp-graylog to reduce the message size.
         Only fields with actual values are sent/displayed.
 
 .. note::
 
-        All "details" field values are string in order to deal with document indexing issues when the type changes
+        All "audit" field values are string in order to deal with document indexing issues when the type changes
         between int and str for example (instead it's always str).
 
 .. code::
 
     {
-        "category": "EXECVE",
-            "details": {
-                "auditserial": "2939394",
-                "uid": "0",
-                "gid": "0",
-                "euid": "0",
-                "fsuid": "0",
-                "egid": "0",
-                "suid": "0",
-                "sessionid": "20239",
-                "ppid": "29929",
-                "cwd": "/home/kang",
-                "username": "root",
-                "auditedusername": "kang",
-                "auid": "1000",
-                "inode": "283892",
-                "parentprocess": "sudo",
-                "process": "/bin/cat",
-                "auditkey": "exe",
-                "tty": "/dev/pts/0"
-            },
-            "hostname": "blah.private.scl3.mozilla.com",
-            "processid": 14619,
-            "processname": "audisp-json",
-            "severity": "INFO",
-            "summary": "Execve: sudo cat /etc/passwd",
-            "tags": [
-                "linux audit",
-                ],
-            "timestamp": "2014-03-18T23:20:31.013344+00:00"
+        "audit_category": "EXECVE",
+        "audit_summary": "Execve: sudo cat /etc/passwd",
+        "audit_hostname": "blah.private.scl3.mozilla.com",
+        "audit_timestamp": "2014-03-18T23:20:31.013344+00:00"
+        "audit_plugin": "audisp-graylog",
+        "audit_version": "1.0.0",
+        "audit": {
+            "serial": "2939394",
+            "uid": "0",
+            "gid": "0",
+            "euid": "0",
+            "fsuid": "0",
+            "egid": "0",
+            "suid": "0",
+            "sessionid": "20239",
+            "ppid": "29929",
+            "cwd": "/home/kang",
+            "username": "root",
+            "auditedusername": "kang",
+            "auid": "1000",
+            "inode": "283892",
+            "parentprocess": "sudo",
+            "process": "/bin/cat",
+            "auditkey": "exe",
+            "tty": "/dev/pts/0"
+        },
     }
 
 Fields reference
@@ -84,35 +80,33 @@ Fields reference
 
 .. note:: See also 'man 8 auditctl' and/or https://access.redhat.com/site/documentation/en-US/Red_Hat_Enterprise_Linux/6/html/Security_Guide/sec-Understanding_Audit_Log_Files.html
 
-:category: Type of message (such as execve, write, chmod, etc.).
-:processid: PID of the process generating the messages (audisp-json's PID)
-:processname: Process name of the process generating the messages (audisp-json).
-:hostname: System FQDN as seen get gethostbyname().
-:severity: Syslog-style severity level.
-:summary: Human readable summary of the message.
-:tags: Various tags to indicate the audisp-json plugin version.
-:timestamp: UTC timestamp, or with timezone set.
-:details.auditserial: The message/event serial sent by audit. This is mainly used for debugging or as a reference between the Mozdef/JSON message and the host's original message.
-:details.uid,gid: User/group id who started the program.
-:details.username: Human readable alias of the uid.
-:details.euid: Effective user/group id the program is running as.
-:details.fsuid,fsgid: User/group id of the owner of the running program itself, on the filesystem.
-:details.ouid,ouid: Owner user/group id on the filesystem.
-:details.suid,sgid: Saved user/group id - used when changing uid sets within the program, but a uid/gid has been saved (i.e. the program can revert to the suid if it wants to).
-:details.auid or details.originaluid: Auditd user id - the original user who logged in (always the same even after setuid - this is generally set by PAM).
-:details.originaluser: Human readable alias of the auid/originaluid.
-:details.rdev: Recorded device identifier (MAJOR:MINOR numbers) 
-:details.rdev: Recorded device identifier for special files.
-:details.mode: File mode on the filesystem (full numeral mode, such as 0100600 - that would be 0600 "short mode" or u+rw or -rw------).
-:details.sessionid: Kernel session identifier for the user running the program. It's set at login.
-:details.tty: If any TTY is attached, it's there - used by interactive shells usually (such as /dev/pts/0).
-:details.auditkey: Custom identifier set by the person setting audit rules on the system.
-:details.process: Program involved's full path.
-:details.pid: PID of the program involved.
-:details.inode: Node identifier on the filesystem for the program.
-:details.cwd: Current working directory of the program.
-:details.parentprocess: Name of the parent process which has spawned details.process.
-:details.ppid: PID of the parent process.
+:audit_category: Type of message (such as execve, write, chmod, etc.).
+:audit_summary: Human readable summary of the message.
+:audit_hostname: System FQDN as seen get gethostbyname().
+:audit_timestamp: UTC timestamp, or with timezone set.
+:audit_plugin: Audit plugin name (audisp-graylog).
+:audit_version: Audit plugin version.
+:audit.serial: The message/event serial sent by audit. This is mainly used for debugging or as a reference between the Mozdef/JSON message and the host's original message.
+:audit.uid,gid: User/group id who started the program.
+:audit.username: Human readable alias of the uid.
+:audit.euid: Effective user/group id the program is running as.
+:audit.fsuid,fsgid: User/group id of the owner of the running program itself, on the filesystem.
+:audit.ouid,ouid: Owner user/group id on the filesystem.
+:audit.suid,sgid: Saved user/group id - used when changing uid sets within the program, but a uid/gid has been saved (i.e. the program can revert to the suid if it wants to).
+:audit.auid or audit.originaluid: Auditd user id - the original user who logged in (always the same even after setuid - this is generally set by PAM).
+:audit.originaluser: Human readable alias of the auid/originaluid.
+:audit.rdev: Recorded device identifier (MAJOR:MINOR numbers).
+:audit.rdev: Recorded device identifier for special files.
+:audit.mode: File mode on the filesystem (full numeral mode, such as 0100600 - that would be 0600 "short mode" or u+rw or -rw------).
+:audit.sessionid: Kernel session identifier for the user running the program. It's set at login.
+:audit.tty: If any TTY is attached, it's there - used by interactive shells usually (such as /dev/pts/0).
+:audit.auditkey: Custom identifier set by the person setting audit rules on the system.
+:audit.process: Program involved's full path.
+:audit.pid: PID of the program involved.
+:audit.inode: Node identifier on the filesystem for the program.
+:audit.cwd: Current working directory of the program.
+:audit.parentprocess: Name of the parent process which has spawned audit.process.
+:audit.ppid: PID of the parent process.
 
 Implemented message categories
 ------------------------------
