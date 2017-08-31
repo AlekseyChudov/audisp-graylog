@@ -57,7 +57,7 @@ Example for rsyslog
 
  ::
 
-    if $programname == 'audisp-graylog' and $msg startswith '{"audit_category":' then {
+    if $programname == 'audisp-graylog' then {
         *.* @graylog.example.com:5514;RSYSLOG_SyslogProtocol23Format
         stop
     }
